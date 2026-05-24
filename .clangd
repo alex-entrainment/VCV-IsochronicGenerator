@@ -1,0 +1,9 @@
+CompileFlags:
+  Add: 
+    - -std=c++17
+    - -DARCH_WIN
+    - -D_USE_MATH_DEFINES
+    - -IC:\Users\alexb\vcv\Rack-SDK\include
+    - -IC:\Users\alexb\vcv\Rack-SDK\dep\include
+    - -IC:\Users\alexb\vcv\Rack-SDK\dep\include\freetype2
+    - -Isrc
