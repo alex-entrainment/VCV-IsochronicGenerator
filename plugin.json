@@ -12,5 +12,16 @@
   "sourceUrl": "",
   "donateUrl": "",
   "changelogUrl": "",
-  "modules": []
+  "modules": [
+    {
+      "slug": "IsochronicGenerator",
+      "name": "IsochronicGenerator",
+      "description": "Generates isochronic tones with polyphonic pulse, AM, and FM control",
+      "tags": [
+        "synth voice",
+        "polyphonic",
+        "utility"
+      ]
+    }
+  ]
 }

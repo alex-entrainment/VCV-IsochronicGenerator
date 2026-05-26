@@ -5,6 +5,16 @@
 #include <cmath>
 #include <vector>
 
+/*TODO Init and configure new elements:
+ * P Channel Lights 1-4 x LIGHTS
+ * P Channel Buttons 1-4 x PARAMS
+ * AM Rate Light x LIGHT
+ * FM Rate Light x LIGHT
+ * Sync IN x INPUT
+ * Alt Toggle IN x INPUT
+ * --Added to enums
+ */
+
 namespace {
 
 constexpr float kDefaultSampleRate = 44100.f;
@@ -27,6 +37,7 @@ constexpr std::array<float, 4> kFmRangeMaxOptions = {100.f, 50.f, 20.f, 10.f};
 constexpr std::array<float, 2> kVOctMinOptions = {-5.f, 0.f};
 constexpr std::array<float, 2> kVOctMaxOptions = {5.f, 10.f};
 constexpr std::array<int, 4> kPolyphonyChannelOptions = {1, 2, 3, 4};
+constexpr int kEnabledChannelMaskAll = (1 << kMaxSupportedPolyphony) - 1;
 
 struct EffectiveControls {
   float beatHz = 4.f;
@@ -48,6 +59,7 @@ struct PersistentState {
   int fmRangeRangeIndex = 0;
   int vOctRangeIndex = 0;
   int polyphonyModeIndex = 0;
+  int enabledChannelMask = 0x1;
 };
 
 template <size_t N> size_t clampIndex(int index) {
@@ -133,6 +145,10 @@ struct IsochronicGenerator : Module {
     RAMP_P_CV_KNOB_PARAM,
     RAMP_P_KNOB_PARAM,
     GAP_P_CV_KNOB_PARAM,
+    P_ENABLE_BUTTON_1,
+    P_ENABLE_BUTTON_2,
+    P_ENABLE_BUTTON_3,
+    P_ENABLE_BUTTON_4,
     PARAMS_LEN
   };
   enum InputId {
@@ -144,10 +160,23 @@ struct IsochronicGenerator : Module {
     FMRANGE_CV_IN_INPUT,
     RAMP_CV_IN_INPUT,
     GAP_CV_IN_INPUT,
+    SYNC_IN_INPUT,
+    ALTERNATE_MODE_SWITCH_CV_IN,
     INPUTS_LEN
   };
+
   enum OutputId { R_OUT_OUTPUT, L_OUT_OUTPUT, OUTPUTS_LEN };
-  enum LightId { BF_LIGHT_LIGHT, LIGHTS_LEN };
+
+  enum LightId {
+    BF_LIGHT_LIGHT,
+    AM_RATE_LIGHT_LIGHT,
+    FM_RATE_LIGHT_LIGHT,
+    P_CHANNEL_1_LIGHT_LIGHT,
+    P_CHANNEL_2_LIGHT_LIGHT,
+    P_CHANNEL_3_LIGHT_LIGHT,
+    P_CHANNEL_4_LIGHT_LIGHT,
+    LIGHTS_LEN
+  };
 
   float sampleRate = kDefaultSampleRate;
   float sampleTime = 1.f / kDefaultSampleRate;
@@ -157,10 +186,14 @@ struct IsochronicGenerator : Module {
   std::array<float, kMaxSupportedPolyphony> rightPhases = {};
   std::array<float, kMaxSupportedPolyphony> beatPhases = {};
   std::array<bool, kMaxSupportedPolyphony> alternatingPulseOnLeft = {};
+  std::array<bool, kMaxSupportedPolyphony> enabledChannels = {true, false,
+                                                              false, false};
   std::array<float, kMaxSupportedPolyphony> amPhases = {};
   std::array<float, kMaxSupportedPolyphony> fmPhases = {};
   std::array<bool, kMaxSupportedPolyphony> controlsPrimed = {};
   std::array<EffectiveControls, kMaxSupportedPolyphony> smoothedControls = {};
+  std::array<dsp::SchmittTrigger, kMaxSupportedPolyphony> channelButtonTriggers;
+  dsp::SchmittTrigger syncTrigger;
   PersistentState persistentState;
 
   IsochronicGenerator() {
@@ -196,8 +229,12 @@ struct IsochronicGenerator : Module {
                 0.f, 100.f);
     configParam(RAMP_P_KNOB_PARAM, 0.f, 1.f, 0.2f, "Tone ramp %", "%", 0.f,
                 100.f);
-    configParam(GAP_P_CV_KNOB_PARAM, -1.f, 1.f, 0.f, "Tone gap CV %", "%",
-                0.f, 100.f);
+    configParam(GAP_P_CV_KNOB_PARAM, -1.f, 1.f, 0.f, "Tone gap CV %", "%", 0.f,
+                100.f);
+    configButton(P_ENABLE_BUTTON_1, "Polyphonic Output Ch 1 Toggle");
+    configButton(P_ENABLE_BUTTON_2, "Polyphonic Output Ch 2 Toggle");
+    configButton(P_ENABLE_BUTTON_3, "Polyphonic Output Ch 3 Toggle");
+    configButton(P_ENABLE_BUTTON_4, "Polyphonic Output Ch 4 Toggle");
 
     configInput(V_OCT_IN_INPUT, "Pitch CV");
     configInput(BF_CV_IN_INPUT, "Beat frequency CV");
@@ -207,6 +244,9 @@ struct IsochronicGenerator : Module {
     configInput(FMRANGE_CV_IN_INPUT, "Frequency modulation range CV");
     configInput(RAMP_CV_IN_INPUT, "Ramp % CV");
     configInput(GAP_CV_IN_INPUT, "Gap % CV");
+    configInput(SYNC_IN_INPUT, "Time / Phase Sync in");
+    configInput(ALTERNATE_MODE_SWITCH_CV_IN,
+                "Alternating Mode Switch Toggle CV in (>0V = Enabled)");
 
     configOutput(L_OUT_OUTPUT, "Left output");
     configOutput(R_OUT_OUTPUT, "Right output");
@@ -240,41 +280,54 @@ struct IsochronicGenerator : Module {
     amPhases.fill(0.f);
     fmPhases.fill(0.f);
     lightEnvelope = 0.f;
+    for (dsp::SchmittTrigger &trigger : channelButtonTriggers) {
+      trigger.reset();
+    }
+    syncTrigger.reset();
     resetSmoothedControlState();
+  }
+
+  void resetPhaseAlignment() {
+    leftPhases.fill(0.f);
+    rightPhases.fill(0.f);
+    beatPhases.fill(0.f);
+    alternatingPulseOnLeft.fill(true);
+    amPhases.fill(0.f);
+    fmPhases.fill(0.f);
+    lightEnvelope = 0.f;
   }
 
   void applyParamLimit(int paramId, float minValue, float maxValue) {
     if (engine::ParamQuantity *quantity = getParamQuantity(paramId)) {
       quantity->minValue = minValue;
       quantity->maxValue = maxValue;
-      quantity->defaultValue = clamp(quantity->defaultValue, minValue, maxValue);
+      quantity->defaultValue =
+          clamp(quantity->defaultValue, minValue, maxValue);
       quantity->setValue(clamp(quantity->getValue(), minValue, maxValue));
     }
   }
 
   void applyPersistentState() {
     persistentState.schemaVersion = kSchemaVersion;
-    persistentState.beatRangeIndex =
-        static_cast<int>(clampIndex<kBeatMaxOptions.size()>(
-            persistentState.beatRangeIndex));
+    persistentState.beatRangeIndex = static_cast<int>(
+        clampIndex<kBeatMaxOptions.size()>(persistentState.beatRangeIndex));
     persistentState.carrierRangeIndex =
         static_cast<int>(clampIndex<kCarrierMaxOptions.size()>(
             persistentState.carrierRangeIndex));
-    persistentState.amRateRangeIndex =
-        static_cast<int>(clampIndex<kAmRateMaxOptions.size()>(
-            persistentState.amRateRangeIndex));
-    persistentState.fmRateRangeIndex =
-        static_cast<int>(clampIndex<kFmRateMaxOptions.size()>(
-            persistentState.fmRateRangeIndex));
+    persistentState.amRateRangeIndex = static_cast<int>(
+        clampIndex<kAmRateMaxOptions.size()>(persistentState.amRateRangeIndex));
+    persistentState.fmRateRangeIndex = static_cast<int>(
+        clampIndex<kFmRateMaxOptions.size()>(persistentState.fmRateRangeIndex));
     persistentState.fmRangeRangeIndex =
         static_cast<int>(clampIndex<kFmRangeMaxOptions.size()>(
             persistentState.fmRangeRangeIndex));
-    persistentState.vOctRangeIndex =
-        static_cast<int>(clampIndex<kVOctMinOptions.size()>(
-            persistentState.vOctRangeIndex));
+    persistentState.vOctRangeIndex = static_cast<int>(
+        clampIndex<kVOctMinOptions.size()>(persistentState.vOctRangeIndex));
     persistentState.polyphonyModeIndex =
         static_cast<int>(clampIndex<kPolyphonyChannelOptions.size()>(
             persistentState.polyphonyModeIndex));
+    persistentState.enabledChannelMask =
+        clamp(persistentState.enabledChannelMask, 0, kEnabledChannelMaskAll);
 
     applyParamLimit(BF_KNOB_PARAM, 0.f,
                     kBeatMaxOptions[persistentState.beatRangeIndex]);
@@ -287,23 +340,103 @@ struct IsochronicGenerator : Module {
     applyParamLimit(FM_RANGE_KNOB_PARAM, 0.f,
                     kFmRangeMaxOptions[persistentState.fmRangeRangeIndex]);
 
+    for (int channel = 0; channel < kMaxSupportedPolyphony; ++channel) {
+      enabledChannels[channel] =
+          (persistentState.enabledChannelMask & (1 << channel)) != 0;
+    }
+
     resetSmoothedControlState();
   }
 
-  int getSelectedPolyphonyChannels() {
-    const size_t index =
-        clampIndex<kPolyphonyChannelOptions.size()>(
-            persistentState.polyphonyModeIndex);
-    return kPolyphonyChannelOptions[index];
+  void updatePersistentPolyphonyStateFromButtons() {
+    int mask = 0;
+    int highestEnabledChannel = 0;
+    for (int channel = 0; channel < kMaxSupportedPolyphony; ++channel) {
+      if (enabledChannels[channel]) {
+        mask |= (1 << channel);
+        highestEnabledChannel = channel + 1;
+      }
+    }
+
+    persistentState.enabledChannelMask = mask;
+    if (highestEnabledChannel > 0) {
+      persistentState.polyphonyModeIndex = highestEnabledChannel - 1;
+    } else {
+      persistentState.polyphonyModeIndex = 0;
+    }
+  }
+
+  void setEnabledChannelCount(int channels) {
+    channels = clamp(channels, 1, kMaxSupportedPolyphony);
+    persistentState.enabledChannelMask = 0;
+    for (int channel = 0; channel < channels; ++channel) {
+      enabledChannels[channel] = true;
+      persistentState.enabledChannelMask |= (1 << channel);
+    }
+    for (int channel = channels; channel < kMaxSupportedPolyphony; ++channel) {
+      enabledChannels[channel] = false;
+    }
+    persistentState.polyphonyModeIndex = channels - 1;
   }
 
   int getActiveChannels() {
-    const int selectedChannels = getSelectedPolyphonyChannels();
-    const int pitchChannels = inputs[V_OCT_IN_INPUT].getChannels();
-    if (pitchChannels > 1) {
-      return std::min(selectedChannels, pitchChannels);
+    int highestEnabledChannel = 0;
+    for (int channel = 0; channel < kMaxSupportedPolyphony; ++channel) {
+      if (enabledChannels[channel]) {
+        highestEnabledChannel = channel + 1;
+      }
     }
-    return selectedChannels;
+    return std::max(1, highestEnabledChannel);
+  }
+
+  int getInternalVoiceCount() {
+    return kMaxSupportedPolyphony;
+  }
+
+  bool getAlternatingMode() {
+    if (inputs[ALTERNATE_MODE_SWITCH_CV_IN].isConnected()) {
+      return inputs[ALTERNATE_MODE_SWITCH_CV_IN].getVoltage() > 0.f;
+    }
+    return params[ALTERNATE_MODE_SWITCH_PARAM].getValue() >= 0.5f;
+  }
+
+  void processChannelEnableButtons() {
+    static const std::array<int, kMaxSupportedPolyphony> kButtonParamIds = {
+        P_ENABLE_BUTTON_1, P_ENABLE_BUTTON_2, P_ENABLE_BUTTON_3,
+        P_ENABLE_BUTTON_4};
+
+    for (int channel = 0; channel < kMaxSupportedPolyphony; ++channel) {
+      if (channelButtonTriggers[channel].process(
+              params[kButtonParamIds[channel]].getValue(), 0.1f, 0.5f)) {
+        enabledChannels[channel] = !enabledChannels[channel];
+        updatePersistentPolyphonyStateFromButtons();
+      }
+    }
+  }
+
+  void updatePanelLights(const ProcessArgs &args,
+                         const EffectiveControls *channelZeroControls,
+                         float amPhase, float fmPhase) {
+    const float amRateLight =
+        (channelZeroControls &&
+         channelZeroControls->amRateHz > kBeatStoppedThresholdHz)
+            ? 0.15f + 0.85f * 0.5f * (std::sin(kTwoPi * amPhase) + 1.f)
+            : 0.f;
+    const float fmRateLight =
+        (channelZeroControls &&
+         channelZeroControls->fmRateHz > kBeatStoppedThresholdHz)
+            ? 0.15f + 0.85f * 0.5f * (std::sin(kTwoPi * fmPhase) + 1.f)
+            : 0.f;
+
+    lights[AM_RATE_LIGHT_LIGHT].setBrightnessSmooth(amRateLight,
+                                                    args.sampleTime);
+    lights[FM_RATE_LIGHT_LIGHT].setBrightnessSmooth(fmRateLight,
+                                                    args.sampleTime);
+
+    for (int channel = 0; channel < kMaxSupportedPolyphony; ++channel) {
+      lights[P_CHANNEL_1_LIGHT_LIGHT + channel].setBrightnessSmooth(
+          enabledChannels[channel] ? 1.f : 0.f, args.sampleTime);
+    }
   }
 
   float getInputVoltageForChannel(int inputId, int channel) {
@@ -314,7 +447,8 @@ struct IsochronicGenerator : Module {
     const size_t rangeIndex =
         clampIndex<kVOctMinOptions.size()>(persistentState.vOctRangeIndex);
     const float voltage = getInputVoltageForChannel(V_OCT_IN_INPUT, channel);
-    return clamp(voltage, kVOctMinOptions[rangeIndex], kVOctMaxOptions[rangeIndex]);
+    return clamp(voltage, kVOctMinOptions[rangeIndex],
+                 kVOctMaxOptions[rangeIndex]);
   }
 
   EffectiveControls resolveTargets(int channel) {
@@ -324,10 +458,12 @@ struct IsochronicGenerator : Module {
     const float carrierMax =
         kCarrierMaxOptions[clampIndex<kCarrierMaxOptions.size()>(
             persistentState.carrierRangeIndex)];
-    const float amRateMax = kAmRateMaxOptions[clampIndex<kAmRateMaxOptions.size()>(
-        persistentState.amRateRangeIndex)];
-    const float fmRateMax = kFmRateMaxOptions[clampIndex<kFmRateMaxOptions.size()>(
-        persistentState.fmRateRangeIndex)];
+    const float amRateMax =
+        kAmRateMaxOptions[clampIndex<kAmRateMaxOptions.size()>(
+            persistentState.amRateRangeIndex)];
+    const float fmRateMax =
+        kFmRateMaxOptions[clampIndex<kFmRateMaxOptions.size()>(
+            persistentState.fmRateRangeIndex)];
     const float fmRangeMax =
         kFmRangeMaxOptions[clampIndex<kFmRangeMaxOptions.size()>(
             persistentState.fmRangeRangeIndex)];
@@ -355,11 +491,10 @@ struct IsochronicGenerator : Module {
         applyScaledCv(params[FM_RATE_KNOB_PARAM].getValue(),
                       getInputVoltageForChannel(FMRATE_CV_IN_INPUT, channel),
                       params[FM_RATE_CV_KNOB_PARAM].getValue(), 0.f, fmRateMax);
-    targets.fmRangeHz =
-        applyScaledCv(params[FM_RANGE_KNOB_PARAM].getValue(),
-                      getInputVoltageForChannel(FMRANGE_CV_IN_INPUT, channel),
-                      params[FM_RANGE_CV_KNOB_PARAM].getValue(), 0.f,
-                      fmRangeMax);
+    targets.fmRangeHz = applyScaledCv(
+        params[FM_RANGE_KNOB_PARAM].getValue(),
+        getInputVoltageForChannel(FMRANGE_CV_IN_INPUT, channel),
+        params[FM_RANGE_CV_KNOB_PARAM].getValue(), 0.f, fmRangeMax);
     targets.gapFraction =
         applyScaledCv(params[GAP_P_KNOB_PARAM].getValue(),
                       getInputVoltageForChannel(GAP_CV_IN_INPUT, channel),
@@ -403,8 +538,7 @@ struct IsochronicGenerator : Module {
 
   json_t *dataToJson() override {
     json_t *rootJ = json_object();
-    json_object_set_new(rootJ, "schemaVersion",
-                        json_integer(kSchemaVersion));
+    json_object_set_new(rootJ, "schemaVersion", json_integer(kSchemaVersion));
     json_object_set_new(rootJ, "beatRangeIndex",
                         json_integer(persistentState.beatRangeIndex));
     json_object_set_new(rootJ, "carrierRangeIndex",
@@ -419,6 +553,8 @@ struct IsochronicGenerator : Module {
                         json_integer(persistentState.vOctRangeIndex));
     json_object_set_new(rootJ, "polyphonyModeIndex",
                         json_integer(persistentState.polyphonyModeIndex));
+    json_object_set_new(rootJ, "enabledChannelMask",
+                        json_integer(persistentState.enabledChannelMask));
     return rootJ;
   }
 
@@ -456,6 +592,17 @@ struct IsochronicGenerator : Module {
     persistentState.polyphonyModeIndex =
         readIndex("polyphonyModeIndex", persistentState.polyphonyModeIndex);
 
+    json_t *enabledChannelMaskJ = json_object_get(rootJ, "enabledChannelMask");
+    if (enabledChannelMaskJ && json_is_integer(enabledChannelMaskJ)) {
+      persistentState.enabledChannelMask =
+          static_cast<int>(json_integer_value(enabledChannelMaskJ));
+    } else {
+      const int legacyChannels =
+          kPolyphonyChannelOptions[clampIndex<kPolyphonyChannelOptions.size()>(
+              persistentState.polyphonyModeIndex)];
+      persistentState.enabledChannelMask = (1 << legacyChannels) - 1;
+    }
+
     applyPersistentState();
     resetRuntimeState();
   }
@@ -471,15 +618,24 @@ struct IsochronicGenerator : Module {
   }
 
   void process(const ProcessArgs &args) override {
-    const int activeChannels = getActiveChannels();
-    outputs[L_OUT_OUTPUT].setChannels(activeChannels);
-    outputs[R_OUT_OUTPUT].setChannels(activeChannels);
+    processChannelEnableButtons();
+    if (syncTrigger.process(inputs[SYNC_IN_INPUT].getVoltage(), 0.1f, 1.f)) {
+      resetPhaseAlignment();
+    }
 
-    const bool alternatingMode =
-        params[ALTERNATE_MODE_SWITCH_PARAM].getValue() >= 0.5f;
+    const int outputChannels = getActiveChannels();
+    const int internalVoices = getInternalVoiceCount();
+    outputs[L_OUT_OUTPUT].setChannels(outputChannels);
+    outputs[R_OUT_OUTPUT].setChannels(outputChannels);
+
+    const bool alternatingMode = getAlternatingMode();
     float firstChannelEnvelope = 0.f;
+    EffectiveControls channelZeroControls;
+    bool channelZeroControlsValid = false;
+    float channelZeroAmPhase = 0.f;
+    float channelZeroFmPhase = 0.f;
 
-    for (int channel = 0; channel < activeChannels; ++channel) {
+    for (int channel = 0; channel < internalVoices; ++channel) {
       const EffectiveControls targets = resolveTargets(channel);
       if (!controlsPrimed[channel]) {
         primeSmoothedControls(channel, targets);
@@ -512,15 +668,14 @@ struct IsochronicGenerator : Module {
 
       leftPhases[channel] = wrapPhase(leftPhases[channel] +
                                       instantaneousCarrierHz * args.sampleTime);
-      rightPhases[channel] = wrapPhase(rightPhases[channel] +
-                                       instantaneousCarrierHz * args.sampleTime);
+      rightPhases[channel] = wrapPhase(
+          rightPhases[channel] + instantaneousCarrierHz * args.sampleTime);
 
       float leftEnvelope = 1.f;
       float rightEnvelope = 1.f;
       if (controls.beatHz > kBeatStoppedThresholdHz) {
-        const float baseEnvelope =
-            computeIsochronicEnvelope(beatPhases[channel], controls.gapFraction,
-                                      controls.rampFraction);
+        const float baseEnvelope = computeIsochronicEnvelope(
+            beatPhases[channel], controls.gapFraction, controls.rampFraction);
 
         leftEnvelope = baseEnvelope;
         rightEnvelope = baseEnvelope;
@@ -540,17 +695,31 @@ struct IsochronicGenerator : Module {
       const float rightOutput =
           rightCarrier * amGain * rightEnvelope * kAudioLevelVolts;
 
-      outputs[L_OUT_OUTPUT].setVoltage(leftOutput, channel);
-      outputs[R_OUT_OUTPUT].setVoltage(rightOutput, channel);
+      const bool channelEnabled =
+          channel < kMaxSupportedPolyphony ? enabledChannels[channel] : false;
+      if (channel < outputChannels) {
+        outputs[L_OUT_OUTPUT].setVoltage(channelEnabled ? leftOutput : 0.f,
+                                         channel);
+        outputs[R_OUT_OUTPUT].setVoltage(channelEnabled ? rightOutput : 0.f,
+                                         channel);
+      }
 
       if (channel == 0) {
-        firstChannelEnvelope = std::max(leftEnvelope, rightEnvelope);
+        firstChannelEnvelope =
+            channelEnabled ? std::max(leftEnvelope, rightEnvelope) : 0.f;
+        channelZeroControls = controls;
+        channelZeroControlsValid = true;
+        channelZeroAmPhase = amPhases[channel];
+        channelZeroFmPhase = fmPhases[channel];
       }
     }
 
     lightEnvelope += (firstChannelEnvelope - lightEnvelope) *
                      std::min(1.f, args.sampleTime * 30.f);
     lights[BF_LIGHT_LIGHT].setBrightnessSmooth(lightEnvelope, args.sampleTime);
+    updatePanelLights(args,
+                      channelZeroControlsValid ? &channelZeroControls : nullptr,
+                      channelZeroAmPhase, channelZeroFmPhase);
   }
 };
 
@@ -568,89 +737,107 @@ struct IsochronicGeneratorWidget : ModuleWidget {
     addChild(createWidget<ScrewSilver>(Vec(
         box.size.x - 2 * RACK_GRID_WIDTH, RACK_GRID_HEIGHT - RACK_GRID_WIDTH)));
 
-    addParam(createParamCentered<CKSS>(Vec(257.282, 35.2), module,
-                                       IsochronicGenerator::
-                                           ALTERNATE_MODE_SWITCH_PARAM));
+    addParam(createParamCentered<CKSS>(
+        Vec(319.204, 92.438), module,
+        IsochronicGenerator::ALTERNATE_MODE_SWITCH_PARAM));
     addParam(createParamCentered<RoundBlackKnob>(
-        Vec(81.547, 92.438), module,
-        IsochronicGenerator::BF_CV_KNOB_PARAM));
+        Vec(81.547, 92.438), module, IsochronicGenerator::BF_CV_KNOB_PARAM));
     addParam(createParamCentered<RoundBlackKnob>(
-        Vec(150.337, 92.438), module,
-        IsochronicGenerator::BF_KNOB_PARAM));
+        Vec(150.337, 92.438), module, IsochronicGenerator::BF_KNOB_PARAM));
     addParam(createParamCentered<RoundBlackKnob>(
-        Vec(257.282, 92.438), module,
-        IsochronicGenerator::CF_KNOB_PARAM));
+        Vec(230.351, 92.438), module, IsochronicGenerator::CF_KNOB_PARAM));
     addParam(createParamCentered<RoundBlackKnob>(
-        Vec(43.664, 177.908), module,
+        Vec(51.396, 202.092), module,
         IsochronicGenerator::AM_RATE_KNOB_PARAM));
     addParam(createParamCentered<RoundBlackKnob>(
-        Vec(114.559, 177.908), module,
+        Vec(139.986, 202.092), module,
         IsochronicGenerator::AM_DEPTH_KNOB_PARAM));
     addParam(createParamCentered<RoundBlackKnob>(
-        Vec(186.04, 177.908), module,
+        Vec(228.418, 202.092), module,
         IsochronicGenerator::FM_RATE_KNOB_PARAM));
     addParam(createParamCentered<RoundBlackKnob>(
-        Vec(257.01, 177.908), module,
+        Vec(316.86, 202.092), module,
         IsochronicGenerator::FM_RANGE_KNOB_PARAM));
     addParam(createParamCentered<RoundBlackKnob>(
-        Vec(43.664, 235.01), module,
+        Vec(51.396, 261.833), module,
         IsochronicGenerator::AM_RATE_CV_KNOB_PARAM));
     addParam(createParamCentered<RoundBlackKnob>(
-        Vec(114.559, 235.01), module,
+        Vec(139.986, 261.833), module,
         IsochronicGenerator::AM_DEPTH_CV_KNOB_PARAM));
     addParam(createParamCentered<RoundBlackKnob>(
-        Vec(186.754, 235.01), module,
+        Vec(228.418, 261.818), module,
         IsochronicGenerator::FM_RATE_CV_KNOB_PARAM));
     addParam(createParamCentered<RoundBlackKnob>(
-        Vec(257.01, 235.01), module,
+        Vec(316.86, 261.818), module,
         IsochronicGenerator::FM_RANGE_CV_KNOB_PARAM));
     addParam(createParamCentered<RoundBlackKnob>(
-        Vec(43.664, 313.104), module,
-        IsochronicGenerator::GAP_P_KNOB_PARAM));
+        Vec(441.067, 202.092), module, IsochronicGenerator::GAP_P_KNOB_PARAM));
     addParam(createParamCentered<RoundBlackKnob>(
-        Vec(114.559, 313.104), module,
+        Vec(386.786, 261.818), module,
         IsochronicGenerator::RAMP_P_CV_KNOB_PARAM));
     addParam(createParamCentered<RoundBlackKnob>(
-        Vec(43.664, 347.418), module,
-        IsochronicGenerator::RAMP_P_KNOB_PARAM));
+        Vec(386.786, 202.092), module, IsochronicGenerator::RAMP_P_KNOB_PARAM));
     addParam(createParamCentered<RoundBlackKnob>(
-        Vec(114.559, 347.418), module,
+        Vec(441.067, 261.818), module,
         IsochronicGenerator::GAP_P_CV_KNOB_PARAM));
+    addParam(createParamCentered<VCVButton>(
+        Vec(424.765, 58.456), module, IsochronicGenerator::P_ENABLE_BUTTON_1));
+    addParam(createParamCentered<VCVButton>(
+        Vec(424.765, 84.41), module, IsochronicGenerator::P_ENABLE_BUTTON_2));
+    addParam(createParamCentered<VCVButton>(
+        Vec(424.765, 110.251), module, IsochronicGenerator::P_ENABLE_BUTTON_3));
+    addParam(createParamCentered<VCVButton>(
+        Vec(424.765, 136.123), module, IsochronicGenerator::P_ENABLE_BUTTON_4));
 
     addInput(createInputCentered<PJ301MPort>(
         Vec(27.507, 35.2), module, IsochronicGenerator::V_OCT_IN_INPUT));
-    addInput(
-        createInputCentered<PJ301MPort>(Vec(27.507, 92.032), module,
-                                        IsochronicGenerator::BF_CV_IN_INPUT));
-    addInput(
-        createInputCentered<PJ301MPort>(Vec(43.664, 277.822), module,
-                                        IsochronicGenerator::AMR_CV_IN_INPUT));
-    addInput(
-        createInputCentered<PJ301MPort>(Vec(114.559, 277.822), module,
-                                        IsochronicGenerator::AMD_CV_IN_INPUT));
     addInput(createInputCentered<PJ301MPort>(
-        Vec(185.758, 277.822), module,
+        Vec(27.507, 92.032), module, IsochronicGenerator::BF_CV_IN_INPUT));
+    addInput(createInputCentered<PJ301MPort>(
+        Vec(51.396, 316.95), module, IsochronicGenerator::AMR_CV_IN_INPUT));
+    addInput(createInputCentered<PJ301MPort>(
+        Vec(139.986, 317.075), module, IsochronicGenerator::AMD_CV_IN_INPUT));
+    addInput(createInputCentered<PJ301MPort>(
+        Vec(228.418, 317.075), module,
         IsochronicGenerator::FMRATE_CV_IN_INPUT));
     addInput(createInputCentered<PJ301MPort>(
-        Vec(257.01, 277.822), module,
+        Vec(316.86, 317.075), module,
         IsochronicGenerator::FMRANGE_CV_IN_INPUT));
-    addInput(
-        createInputCentered<PJ301MPort>(Vec(185.758, 314.501), module,
-                                        IsochronicGenerator::RAMP_CV_IN_INPUT));
-    addInput(
-        createInputCentered<PJ301MPort>(Vec(185.758, 347.418), module,
-                                        IsochronicGenerator::GAP_CV_IN_INPUT));
+    addInput(createInputCentered<PJ301MPort>(
+        Vec(386.786, 317.075), module, IsochronicGenerator::RAMP_CV_IN_INPUT));
+    addInput(createInputCentered<PJ301MPort>(
+        Vec(441.067, 317.075), module, IsochronicGenerator::GAP_CV_IN_INPUT));
+    addInput(createInputCentered<PJ301MPort>(
+        Vec(81.547, 35.2), module, IsochronicGenerator::SYNC_IN_INPUT));
+    addInput(createInputCentered<PJ301MPort>(
+        Vec(319.204, 119.68), module,
+        IsochronicGenerator::ALTERNATE_MODE_SWITCH_CV_IN));
 
-    addOutput(
-        createOutputCentered<PJ301MPort>(Vec(256.014, 313.104), module,
-                                         IsochronicGenerator::R_OUT_OUTPUT));
-    addOutput(
-        createOutputCentered<PJ301MPort>(Vec(256.014, 347.418), module,
-                                         IsochronicGenerator::L_OUT_OUTPUT));
+    addOutput(createOutputCentered<PJ301MPort>(
+        Vec(441.067, 352.288), module, IsochronicGenerator::R_OUT_OUTPUT));
+    addOutput(createOutputCentered<PJ301MPort>(
+        Vec(386.786, 352.288), module, IsochronicGenerator::L_OUT_OUTPUT));
 
     addChild(createLightCentered<MediumLight<RedLight>>(
-        Vec(183.061, 92.438), module,
-        IsochronicGenerator::BF_LIGHT_LIGHT));
+        Vec(79.357, 202.092), module,
+        IsochronicGenerator::AM_RATE_LIGHT_LIGHT));
+    addChild(createLightCentered<MediumLight<RedLight>>(
+        Vec(256.44, 203.053), module,
+        IsochronicGenerator::FM_RATE_LIGHT_LIGHT));
+    addChild(createLightCentered<MediumLight<RedLight>>(
+        Vec(179.338, 92.438), module, IsochronicGenerator::BF_LIGHT_LIGHT));
+    addChild(createLightCentered<MediumLight<GreenLight>>(
+        Vec(454.176, 58.456), module,
+        IsochronicGenerator::P_CHANNEL_1_LIGHT_LIGHT));
+    addChild(createLightCentered<MediumLight<GreenLight>>(
+        Vec(454.176, 84.41), module,
+        IsochronicGenerator::P_CHANNEL_2_LIGHT_LIGHT));
+    addChild(createLightCentered<MediumLight<GreenLight>>(
+        Vec(454.176, 110.251), module,
+        IsochronicGenerator::P_CHANNEL_3_LIGHT_LIGHT));
+    addChild(createLightCentered<MediumLight<GreenLight>>(
+        Vec(454.176, 137.084), module,
+        IsochronicGenerator::P_CHANNEL_4_LIGHT_LIGHT));
   }
 
   void appendContextMenu(Menu *menu) override {
@@ -663,13 +850,13 @@ struct IsochronicGeneratorWidget : ModuleWidget {
 
     menu->addChild(new MenuSeparator());
     menu->addChild(createMenuLabel("IsochronicGenerator"));
-    menu->addChild(createSubmenuItem(
-        "Dial maxima", "",
-        [module](Menu *submenu) {
+    menu->addChild(
+        createSubmenuItem("Dial maxima", "", [module](Menu *submenu) {
           submenu->addChild(createIndexSubmenuItem(
               "Beat frequency", {"100 Hz", "50 Hz", "20 Hz", "10 Hz"},
               [module]() {
-                return static_cast<size_t>(module->persistentState.beatRangeIndex);
+                return static_cast<size_t>(
+                    module->persistentState.beatRangeIndex);
               },
               [module](size_t index) {
                 module->persistentState.beatRangeIndex =
@@ -733,14 +920,14 @@ struct IsochronicGeneratorWidget : ModuleWidget {
           module->applyPersistentState();
         }));
     menu->addChild(createIndexSubmenuItem(
-        "Polyphony", {"1 channel (mono)", "2 channels", "3 channels",
-                      "4 channels"},
+        "Polyphony",
+        {"1 channel (mono)", "2 channels", "3 channels", "4 channels"},
         [module]() {
-          return static_cast<size_t>(module->persistentState.polyphonyModeIndex);
+          return static_cast<size_t>(
+              module->persistentState.polyphonyModeIndex);
         },
         [module](size_t index) {
-          module->persistentState.polyphonyModeIndex = static_cast<int>(index);
-          module->applyPersistentState();
+          module->setEnabledChannelCount(static_cast<int>(index) + 1);
         }));
   }
 };
